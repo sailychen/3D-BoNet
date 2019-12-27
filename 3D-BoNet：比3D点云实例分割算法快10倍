@@ -1,0 +1,368 @@
+3D-BoNet：比3D点云实例分割算法快10倍！代码已开源
+我爱计算机视觉 5天前
+点击我爱计算机视觉标星，更快获取CVML新技术
+
+
+
+本文转载自新智元（AI_era）
+
+
+
+
+
+  新智元报道  
+
+来源：投稿
+
+编辑：元子
+
+【新智元导读】本文提出了一种基于边界框回归的高效点云实例分割算法，通过最小化关联代价函数来实现大致的边界框回归，并通过point mask预测来实现最终的实例分割。3D-BoNet不仅在ScanNet和S3DIS数据集上达到了state-of-the-art的效果，比当前大多数算法快了10倍以上。
+
+
+
+
+
+
+
+
+
+Introduction
+
+
+
+实现有效的三维场景理解(3D scene understanding)是计算机视觉和人工智能领域的关键问题之一。近年来，针对三维点云理解的研究取得了显著的进展，在诸如点云目标检测，语义分割等任务上都展现出了很不错的效果。然而，针对于点云实例分割的研究还处于较为初级的阶段。
+
+
+
+Motivation
+
+
+
+如下图所示，当前主流的点云实例分割算法可以分为以下两类：1）基于候选目标框(Proposal-based methods)的算法，例如3D-SIS[1]，GSPN[2]，这类方法通常依赖于两阶段的训练(two-stage training)和昂贵的非极大值抑制(non-maximum suppression, NMS)等操作来对密集的proposal进行选择。2）无候选目标框的算法(Proposal-free methods)，例如SGPN[3], ASIS[4], JSIS3D[5], MASC[6], 3D-BEVIS[7]等。这类算法的核心思想是为每个点学习一个discriminative feature embedding，然后再通过诸如mean-shift等聚类(clustering)方法来将同一个instance的点聚集(group)到一起。这类方法的问题在于最终聚类到一起的instance目标性(objectness)比较差。此外，此类方法后处理步骤(post-processing)的时间成本通常较高。
+
+
+
+图1. 当前主流的点云实例分割算法对比
+
+
+
+
+
+
+不同于上述两类方法，我们提出了一个single stage, anchor free并且end-to-end的基于边界框回归的实例分割算法(3D-BoNet)。该算法具有如下优势
+
+
+
+相比于proposal-free的方法，3D-BoNet显式地去预测目标的边界框，因此最终学到的instance具有更好的目标性(high objectness).
+
+相比于proposal-based的方法，3D-BoNet并不需要复杂耗时的region proposal network以及ROIAlign等操作，因此也不需要NMS等post-processing步骤。
+
+3D-BoNet由非常高效的shared MLP组成，并且不需要诸如非极大值抑制，特征采样(feature sampling)，聚类(clustering)或者投票(voting)等后处理步骤，因此非常高效。
+
+
+
+Overview
+
+
+
+3D-BoNet的总体框架如下图所示，它主要由Instance-level bounding box prediction和Point-level mask prediction两个分支组成。顾名思义，bounding box prediction分支用于预测点云中每个实例的边界框，mask prediction分支用于为边界框内的点预测一个mask，进一步区分边界框内的点是属于instance还是背景。
+
+
+
+图2. 3D-BoNet的总体框架
+
+
+
+
+看到这里，你可能会产生疑惑：这个看起来跟proposal-based的框架好像也没什么区别？
+
+
+
+先说结论：区别很大。但问题是区别到底在哪里呢？
+
+
+
+首先，我们可以回顾下proposal-based方法是怎么产生边界框的呢？没错，就是根据anchor用region proposal network (RPN)来产生大量密集的边界框然后再进一步refine，但这个显然不够高效，而且是否真的有必要产生这么多密集的边界框呢？针对这个问题，我们可以来一个大胆的假设：要不不用RPN，直接让为每一个instance回归(regress)一个唯一的，但可能不是那么准确的边界框呢(如图3所示)？
+
+
+
+图3. 为每一个instance回归一个大致的边界框示例
+
+
+
+
+考虑到3D点云本身就显式地包含了每个物体的几何信息，我们认为这个目标是可行的。然后再更大胆一点，要不直接用global feature来regress每个instance的边界框试试？如果能做到这点，那问题不就解决一半了吗？
+
+
+
+但新的问题马上又来了。。首先，每个三维场景中所包含的实例数目是不一样的(如何让网络自适应的输出不同个数的边界框？)，而且每个点云中的实例还是无顺序的。这就意味着我们即便用网络regress了一系列边界框，也难以将这些边界框和ground truth的边界框一一对应的联系起来，进一步带来的问题就是：我们无法实现对网络的有监督的训练和优化。
+
+
+
+到这里，核心的问题就变成了：我们应该怎么去训练这种网络呢？
+
+
+
+针对这个问题，我们提出了边界框关联层(bounding box association layer)以及multi-criteria loss 函数来实现对网络的训练。换句话说，我们要把这个预测边界框和ground truth边界框关联(配对)的问题建模为一个最优分配问题。
+
+
+
+图4. 边界框预测分支的结构图
+
+
+
+
+如何关联？
+
+
+
+为了将网络预测出来的每一个边界框与ground truth 中的边界框唯一对应地关联起来，我们将其建模为一个最优分配问题。假定 是一个二值(binary)关联索引矩阵，当且仅当第 个预测的边界框分配给ground truth的边界框时。  是关联代价矩阵， 代表将第 个预测的边界框分配给ground truth的边界框的关联代价。一般来说，代表两个边界框的匹配程度，两个边界框越匹配也即代价越小。因此，边界框的最优关联问题也就转变成为寻找总代价最小的最优分配索引矩阵  的问题，用公式表示如下:
+
+ 
+
+
+
+
+下一步，如何计算关联代价矩阵？
+
+
+
+衡量两个三维边界框的匹配程度，最简单直观的评价指标就是比较两个边界框的最小-最大顶点之间的欧式距离。然而，考虑到点云通常都非常稀疏且不均匀地分布在3D空间中,如图4所示，尽管候选框＃2(红色)与候选框＃1(黑色)与ground truth边界框＃0(蓝色)都具有相同的欧式距离，但框＃2显然具有更多有效点(overlap更多)。因此，在计算代价矩阵时，有效点的覆盖率也应该要考虑进来。
+
+
+
+图5. 预测边界框与真实边界框点云覆盖率示意图
+
+
+
+
+
+为此，我们考虑以下三个方面的指标：
+
+
+
+(1) 顶点之间的欧式距离。举例来说，第个预测的边界框  分配给ground truth的边界框 的代价为:
+
+
+
+ 
+
+
+
+(2) Soft IoU。给定输入点云  以及第 ground truth的实例边界框  ，我们可以直接得到一个hard的二值(binary)矢量  来表征每个点是否在边界框内。然而，对于相同输入点云的第  预测框，直接获得类似的hard的二值矢量将导致框架不可微(non-differentiable)。因此，我们引入了一个可微但简单的算法来获得类似但soft的二值矢量，称为point-in-pred-box-probability，详情见paper Algorithm 1。  所有值都在  范围内，这个值越高代表点在框内可能性越大，值越小则对应点可能离框越远。因此，我们定义第个预测的边界框以及第ground truth的边界框的sIoU如下:
+
+
+
+ 
+
+
+
+(3) 此外，我们还考虑了  和  之间的交叉熵。交叉熵倾向于得到更大且具有更高覆盖率的边界框: 
+
+
+
+ 
+
+
+
+总结一下，指标(1)尽可能地使学到的框与ground truth的边界框尽可能地重合，(2)(3)用于尽可能地覆盖更多的点并克服如图5所示的不均匀性。第 个预测的边界框与第ground truth的边界框的最终关联代价为：
+
+
+
+
+
+ Loss function如何定义?
+
+
+
+在通过边界框关联层之后，我们使用关联索引矩阵  对预测边界框 及其对应分数  与groundtruth进行匹配，使得靠前的  个边界框(ground truth的总边界框数)及与ground truth的边界框能匹配上。
+
+
+
+针对边界框预测我们采用了多准则损失函数，也即三者求和：
+
+
+
+
+
+针对边界框分数预测我们采用了另外一个损失函数。预测框分数旨在表征相应预测框的有效性。在通过关联索引矩阵 重新排序以后，我们设定前  个真实的边界框对应的分数为1，剩余的无效的  个边界框对应的分数为 0。我们对这个二元分类任务使用交叉熵损失
+
+
+
+
+
+ 
+
+作为另外一个并行的分支，我们的方法可以采用任意现有的点云语义分割算法(比如Sparseconv, Pointnet++等等)作为对应的语义分割模块，整个网络最终的loss function定义为
+
+
+
+
+
+ 代表语义分割分支的loss，这里我们采用标准的交叉熵。网络具体的优化和求解过程我们采用Hungarian算法，详情请见[8],[9]。
+
+
+
+
+
+如何预测instance mask?
+
+
+
+相比于bounding box prediction分支，这个分支就相对简单很多了,因为只要边界框预测的足够好，这个分支就相当于做一个二值分类问题，即便瞎猜也能有50%正确率。在这个分支中，我们将点的特征点与每个边界框和分数融合在一起，随后为每一个实例预测一个点级别的二值mask。考虑到背景点与实例点数的不平衡，我们采用focal loss[10] 对这个分支进行优化。 
+
+
+
+图 6. Point mask prediction分支结构图。
+
+
+
+
+
+Experiments
+
+
+
+在ScanNet(v2) benchmark上，我们的方法达到了state-of-the-art的效果，相比于3D-SIS，MASC等方法都有显著的提升。
+
+
+
+图7. 我们的方法在ScanNet(V2)的结果
+
+
+
+
+
+在Ablation study中，我们也进一步证实了各个分支以及loss function各个评估指标的作用。详细的分析见paper。
+
+
+
+图 8. Ablation study结果 (S3DIS, Area5）
+
+
+
+
+
+在计算效率方面，3D-BoNet是目前速度最快的方法，相比于SGPN, ASIS, 3D-SIS等方法，3D-BoNet快了十倍以上。
+
+
+
+图 9. 不同方法处理ScanNet validation set所需要的时间消耗。
+
+
+
+
+
+此外，我们还在图10中进一步展示了我们提出的loss function在S3DIS数据集进行训练时（Area1,2,3,4,6进行训练，Area 5进行测试）的变化曲线。从图中可以看到，我们提出的loss function能够比较一致的收敛，从而实现对语义分割分支，边界框预测分支以及point mask预测分支端到端方式的优化。
+
+
+
+图10. 我们的方法在S3DIS数据集上的training loss
+
+
+
+
+
+在图11中我们给出了预测边界框和边界框分数的可视化结果。可以看出，我们方法预测出来的框并不一定非常精准和紧凑。相反，它们相对比较松弛(inclusive)并且具有比较高的目标性(high objectness)。这也与本文一开始希望得到的大致边界框的目标相一致。
+
+
+
+
+
+
+图11. 我们的方法在S3DIS数据集Area 2上的预测边界框和分数的可视化。红色框表示预测的边界框，蓝色的边界框代表ground truth。
+
+
+
+当边界框已经预测好以后，预测每个框内的point mask就容易很多了。最后我们可视化一下预测的instance mask，其中黑点代表属于这个instance的概率接近为0，而带颜色的点代表属于这个instance的概率接近为1，颜色越深，概率越大。
+
+
+
+图12. 预测instance mask的可视化结果。输入点云总共包含四个instance，也即两个椅子，一个桌子以及地面。从左到右分别是椅子#1，椅子#2，桌子#1，地面#2的point mask.
+
+
+
+
+
+
+
+最后总结一下，我们提出了一种基于边界框回归的高效点云实例分割算法，通过最小化匹配代价函数来实现大致的边界框回归，并通过point mask预测来实现最终的实例分割。我们提出的3D-BoNet不仅在ScanNet和S3DIS数据集上达到了state-of-the-art的效果，并且比现有其他算法更加高效。
+
+
+
+Arxiv链接: 
+
+https://arxiv.org/abs/1906.01140
+
+
+
+TensorFlow代码: 
+
+https://github.com/Yang7879/3D-BoNet
+
+
+
+
+作者介绍
+
+
+
+论文合著者包括牛津大学博士生杨波、胡庆拥；谷歌Deepmind 研究员王佳楠；帝国理工Fellow Ronald Clark；赫瑞瓦特助理教授王森；以及牛津大学教授Andrew Markham和Niki Trigoni。
+
+
+
+其中论文一作杨波目前是计算机系在读博士，主要研究方向包括机器学习，计算机视觉和机器人，专注于让智能机器从2D图片或3D点云中理解和重构完整3D场景，这对未来自动驾驶和增强现实(AR)有着至关重要的作用。更多信息见个人主页：https://yang7879.github.io
+
+
+
+
+Reference
+
+
+
+[1] J. Hou, A. Dai, and M. Nießner. 3D-SIS: 3D Semantic Instance Segmentation of RGB-D Scans. CVPR, 2019
+
+[2] L. Yi, W. Zhao, H. Wang, M. Sung, and L. Guibas. GSPN: Generative Shape Proposal Network for 3D Instance Segmentation in Point Cloud. CVPR, 2019.
+
+[3] W. Wang, R. Yu, Q. Huang, and U. Neumann. SGPN: Similarity Group Proposal Network for 3D Point Cloud Instance Segmentation. CVPR, 2018.
+
+[4] X. Wang, S. Liu, X. Shen, C. Shen, and J. Jia. Associatively Segmenting Instances and Semantics in Point Clouds. CVPR, 2019.
+
+[5] Q.-H. Pham, D. T. Nguyen, B.-S. Hua, G. Roig, and S.-K. Yeung. JSIS3D: Joint Semantic-Instance Segmentation of 3D Point Clouds with Multi-Task Pointwise Networks and Multi-Value Conditional Random Fields. CVPR, 2019.
+
+[6] C. Liu and Y. Furukawa. MASC: Multi-scale Affinity with Sparse Convolution for 3D Instance Segmentation. arXiv, 2019.
+
+[7] C. Elich, F. Engelmann, J. Schult, T. Kontogianni, and B. Leibe. 3D-BEVIS: Birds-Eye-View Instance Segmentation. GCPR, 2019.
+
+[8] H. W. Kuhn. The Hungarian Method for the assignment problem. Naval Research Logistics Quarterly, 2(1-2):83–97, 1955.
+
+[9] H. W. Kuhn. Variants of the hungarian method for assignment problems.Naval Research LogisticsQuarterly, 3(4):253–258, 1956
+
+[10] T.-Y. Lin, P. Goyal, R. Girshick, K. He, and P. Dollar. Focal Loss for Dense Object Detection. ICCV, 2017.
+
+
+
+
+
+3D视觉交流群
+
+
+
+关注最新最前沿的3D视觉、三维重建技术，扫码添加CV君拉你入群，（如已为CV君其他账号好友请直接私信）
+
+（请务必注明：3D）
+
+
+
+喜欢在QQ交流的童鞋，可以加52CV官方QQ群：805388940。
+
+（不会时时在线，如果没能及时通过验证还请见谅）
+
+
+
+
+长按关注我爱计算机视觉
+
+
+微信扫一扫
+关注该公众号
